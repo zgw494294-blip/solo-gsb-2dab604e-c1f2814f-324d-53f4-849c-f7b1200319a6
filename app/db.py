@@ -43,6 +43,16 @@ computed by the channel's resolution rules inside the same write
 transaction that stored the receipt and never rewritten afterwards —
 later policy or public-key changes do not alter it, and the
 installation-audit endpoint reads it back as saved.
+
+``channel_safety`` holds at most one risk circuit-breaker rule per
+channel, bound to the channel revision (``rule_revision``) at arming
+time: the minimum canary sample (``min_reports``) and the tolerated
+anomaly percentage (``max_bad_percent``).  The tripped flag is a sticky
+latch — once set it is never cleared by receipt overwrites; an accepted
+channel update deletes the row (the old rule is invalid for the new
+revision), so re-armament requires a fresh ``PUT .../safety``.  Like the
+rest of the policy, rule and latch state live only in this file and
+therefore survive container rebuilds via the mounted volume.
 """
 
 from __future__ import annotations
@@ -148,6 +158,23 @@ def init_db(path: Optional[str] = None) -> None:
                 expected_id  TEXT    NOT NULL,
                 created_at   TEXT    NOT NULL,
                 PRIMARY KEY (channel, device_id),
+                FOREIGN KEY (channel) REFERENCES channels (name)
+            ) WITHOUT ROWID;
+
+            -- One row per channel: the armed risk circuit-breaker rule,
+            -- bound to the channel revision at arming time.  `tripped` is a
+            -- sticky latch: flipped to 1 once the anomaly threshold is
+            -- crossed and never reset by later receipts.  An accepted
+            -- channel update deletes this row (see PUT /channels/{name});
+            -- each revision starts with no rule and must be re-armed.
+            CREATE TABLE IF NOT EXISTS channel_safety (
+                channel         TEXT PRIMARY KEY,
+                rule_revision   INTEGER NOT NULL,
+                min_reports     INTEGER NOT NULL,
+                max_bad_percent INTEGER NOT NULL,
+                tripped         INTEGER NOT NULL DEFAULT 0,
+                created_at      TEXT    NOT NULL,
+                updated_at      TEXT    NOT NULL,
                 FOREIGN KEY (channel) REFERENCES channels (name)
             ) WITHOUT ROWID;
             """

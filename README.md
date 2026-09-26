@@ -6,9 +6,11 @@ SHA-256 校验通过后封存镜像，封存后只读并支持原始内容下载
 Ed25519 签名（attestation），服务端按**当前配置的公钥**实时重验，达到阈值即判定
 可信。在此之上提供**灰度发布通道**：稳定/候选镜像按设备确定性分桶，解析时实时
 重验可信并自动回退；设备安装后向通道**上报回执**，服务端在接收时按决议规则
-冻结应装镜像，并按当前修订号核对成功匹配/偏离/失败的设备数。超过闲置时长的**未封存**任务可由 `POST /images/cleanup`
-连同分片一并回收，封存镜像、签名与通道始终保留。任务、分片、签名、通道策略与
-设备回执全部落盘，容器重建后数据不丢。
+冻结应装镜像，并按当前修订号核对成功匹配/偏离/失败的设备数。通道还可布防
+**灰度风险熔断**：候选镜像样本的异常比例越界即在回执写事务内锁存熔断，熔断后
+灰度桶整体回退到可信稳定镜像且回执覆盖不解除，通道更新后旧规则失效。超过闲置时长的**未封存**任务可由 `POST /images/cleanup`
+连同分片一并回收，封存镜像、签名与通道始终保留。任务、分片、签名、通道策略、
+熔断规则/状态与设备回执全部落盘，容器重建后数据不丢。
 
 ## 一键启动（Docker Compose）
 
@@ -37,7 +39,8 @@ docker compose down -v         # 同时删除数据卷（谨慎）
 
 数据库文件位于容器内 `/data/images.db`（SQLite WAL 模式，另有 `-wal`/`-shm`
 辅助文件），挂载在命名卷 `firmware-data` 上。因此执行 `docker compose up -d
---build` 重建镜像/容器后，历史任务、分片、封存状态与已收录的签名依然可用。
+--build` 重建镜像/容器后，历史任务、分片、封存状态、已收录的签名、灰度通道与
+回执以及熔断规则/锁存状态依然可用。**Compose 启动方式与端口均无变化。**
 
 ## 本地直接运行（不使用 Docker）
 
@@ -64,6 +67,8 @@ IMAGE_DB_PATH=./data/images.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET    | `/images/{id}/trust`              | 按当前公钥重新验签，返回可信判定 |
 | PUT    | `/channels/{name}`                | 创建/更新灰度发布通道（`expected_revision` 乐观并发校验） |
 | GET    | `/channels/{name}/resolve?device_id=...` | 按设备确定性解析灰度通道，实时重验可信并回退 |
+| PUT    | `/channels/{name}/safety`         | 为当前修订号设置/替换灰度**风险熔断**规则（最小样本、最大异常百分比） |
+| GET    | `/channels/{name}/safety`         | 查询熔断规则、当前样本数/异常数与熔断状态 |
 | POST   | `/channels/{name}/receipts`       | 上报设备安装回执（仅接受当前修订号，接收时冻结应装镜像） |
 | GET    | `/channels/{name}/installation-audit` | 按当前修订号统计成功匹配/成功偏离/失败的设备数 |
 | GET    | `/health`                         | 存活探针 |
@@ -91,10 +96,10 @@ IMAGE_DB_PATH=./data/images.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 201    | 任务创建成功 |
 | 200    | 分片上传/查询/封存/下载/签名提交/可信查询成功 |
 | 400    | 分片为空或区间越界；签名接口的 `key_id` 未知、Base64 编码错误或签名无效（均不落库） |
-| 404    | 任务不存在（增量接口中基础镜像或目标镜像任一不存在均返回 404）；通道不存在；`PUT /channels` 中稳定或候选镜像不存在 |
-| 409    | 重叠字节不一致（整次写入回滚）；镜像已封存仍写入；未封存取 content、提交签名、请求增量或请求 Merkle 根/证明；封存时仍有缺口或哈希不匹配；`PUT /channels` 的 `expected_revision` 与当前修订号不符、或任一镜像未封存/当前不可信；解析时稳定镜像失信；回执修订号非当前值、序号小于已存值或同序号内容不同、上报时稳定镜像失信 |
+| 404    | 任务不存在（增量接口中基础镜像或目标镜像任一不存在均返回 404）；通道不存在；`PUT /channels` 中稳定或候选镜像不存在；`GET .../safety` 时通道不存在或当前修订号尚未布防熔断规则（上一修订号的规则在通道更新后已失效） |
+| 409    | 重叠字节不一致（整次写入回滚）；镜像已封存仍写入；未封存取 content、提交签名、请求增量或请求 Merkle 根/证明；封存时仍有缺口或哈希不匹配；`PUT /channels` 的 `expected_revision` 与当前修订号不符、或任一镜像未封存/当前不可信；解析时稳定镜像失信（熔断回退时仍如此）；回执修订号非当前值、序号小于已存值或同序号内容不同、上报时稳定镜像失信；`PUT /channels/{name}/safety` 的 `expected_revision` 与当前修订号不符、或同修订号已布防且新规则数值不同 |
 | 413    | 分片超过 1 MiB |
-| 422    | 请求参数校验失败（JSON 字段、offset 为负等）；`proof` 的 `indices` 非法（为空、超过 64 个、重复、负数、非整数或超出叶范围）；`cleanup` 的 `idle_seconds` 非正整数或 `limit` 不在 1～100；回执的 `seq`/`revision` 非正整数、`status` 非法、`success` 缺 `installed_id` 或 `failed` 携带 `installed_id` |
+| 422    | 请求参数校验失败（JSON 字段、offset 为负等）；`proof` 的 `indices` 非法（为空、超过 64 个、重复、负数、非整数或超出叶范围）；`cleanup` 的 `idle_seconds` 非正整数或 `limit` 不在 1～100；回执的 `seq`/`revision` 非正整数、`status` 非法、`success` 缺 `installed_id` 或 `failed` 携带 `installed_id`；熔断规则的 `min_reports` 不在 1～1000、`max_bad_percent` 不在 0～100 或 `expected_revision` 非正整数 |
 
 ## 使用示例
 
@@ -680,6 +685,102 @@ curl -s "localhost:8000/channels/release-1/installation-audit"
 - `expected_id` 在接收时冻结，**之后的策略调整或公钥轮换都不会改写它**，
   核对始终按接收时的决议结果进行。通道不存在返回 **404**。
 
+## 灰度风险熔断（Canary Risk Circuit Breaker）
+
+每个修订号可以额外布防一条**风险熔断规则**：监控当前修订号灰度桶设备的回执，
+候选镜像异常比例越界即**锁存熔断**，把整个灰度桶回退到可信稳定镜像。规则与
+熔断状态持久化在 SQLite `channel_safety` 表中，随命名卷跨容器重建保留。
+
+### 布防 / 替换规则
+
+```
+PUT /channels/{name}/safety
+{"expected_revision":2,"min_reports":20,"max_bad_percent":5}
+```
+
+- `expected_revision`：必须等于通道**当前修订号**，不符返回 **409** 且不落库。
+- `min_reports`：**1～1000 的整数**，触发熔断所需的最小样本数。
+- `max_bad_percent`：**0～100 的整数**，允许的最大异常百分比。
+- 每个修订号**初始无规则**；同修订号重复提交**完全相同**的规则（两个阈值都
+  不变）是幂等空操作（响应 `stored:"unchanged"`）；同修订号提交**不同**规则
+  返回 **409**——改规则必须先更新通道（修订号 +1）再按新修订号重新布防。
+- 通道不存在返回 **404**；参数非法返回 **422**。
+
+```bash
+curl -s -X PUT "localhost:8000/channels/release-1/safety" \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":2,"min_reports":20,"max_bad_percent":5}'
+# -> {"name":"release-1","revision":2,"rule_revision":2,
+#     "min_reports":20,"max_bad_percent":5,
+#     "reports":0,"anomalies":0,"tripped":false,"status":"monitoring",
+#     "stored":"armed"}
+```
+
+### 样本与异常口径
+
+每次有**新回执落库**（新设备上报或更大 `seq` 覆盖；幂等重交不触发统计），
+服务端在**存放回执的同一个 SQLite 写事务内**立即统计当前修订号：
+
+- **样本**：冻结的应装镜像（`expected_id`）为**候选镜像**的当前修订号回执数，
+  即本应安装候选镜像的设备。因候选失信而把应装镜像冻结为稳定镜像的回执
+  （`candidate_untrusted_fallback`）不进入灰度样本；
+- **异常**：样本中 `status:"failed"`，或上报成功但 `installed_id` 与冻结的
+  `expected_id` 不一致（实装偏离）的设备。每台设备只按其最新回执计入一次。
+
+### 触发条件
+
+当同时满足：
+
+```
+reports >= min_reports
+anomalies × 100 > reports × max_bad_percent   （严格大于；边界不触发）
+```
+
+熔断即被**锁存（latch）为 tripped**，判定与回执写入在同一事务内提交。例如
+`min_reports=20, max_bad_percent=5`：20 个样本中 1 个异常（5%）不触发，第 2
+个异常（10%）触发；`max_bad_percent=0` 时样本达标后出现任何异常立即触发。
+
+### 熔断后的行为
+
+- `GET /channels/{name}/resolve`：所有**候选桶**设备一律导向**可信稳定镜像**，
+  `reason` 标为 `risk_circuit_breaker_fallback`（风险回退）；桶号、灰度
+  `percent` 和修订号都**不变**。候选镜像此时是否可信不再影响候选桶决议；
+  **稳定镜像失信仍然返回 409**（绝不导向不可信镜像）。
+- 熔断后新上报的回执按风险回退后的决议冻结 `expected_id`（稳定镜像）；
+  **后续回执覆盖不能解除熔断**——即使异常设备补交了完美成功的回执，锁存状态
+  也保持 tripped。回执响应中带 `circuit_breaker_tripped` 字段。
+
+### 查询规则与状态
+
+```
+GET /channels/{name}/safety
+```
+
+```bash
+curl -s "localhost:8000/channels/release-1/safety"
+# -> {"name":"release-1","revision":2,"rule_revision":2,
+#     "min_reports":20,"max_bad_percent":5,
+#     "reports":21,"anomalies":2,"tripped":true,"status":"tripped"}
+```
+
+- `reports` / `anomalies` 为上述口径下的实时计数；`status` 为
+  `monitoring`（监控中）或 `tripped`（已熔断锁存）。
+- 通道不存在、或当前修订号没有布防规则（包括尚未重新布防的新修订号）时
+  返回 **404**。
+
+### 恢复方式
+
+熔断状态在**本修订号内单向锁存**，恢复必须通过一次通道更新：
+
+1. 修复候选镜像后用 `PUT /channels/{name}` 发布新策略（哪怕仅提高/调整
+   `percent`），修订号 +1，**旧规则连同熔断锁存在同一事务内删除**；
+2. 对新修订号重新 `PUT /channels/{name}/safety` 布防；
+3. 旧修订号回执不再进入新规则的样本，灰度在新修订号上重新开始；若新候选仍
+   异常，新规则会再次触发。
+
+仅重启容器**不会**解除熔断：规则、计数所依据的回执与锁存状态全部在 SQLite
+命名卷中，跨重建保留。
+
 ## 一致性与并发设计
 
 - **原子校验-写入**：每次分片上传在一个 `BEGIN IMMEDIATE` 事务中完成
@@ -722,10 +823,20 @@ curl -s "localhost:8000/channels/release-1/installation-audit"
   `expected_id` 在接收事务内按决议规则算出并冻结，后续策略调整或公钥轮换均不
   改写；`installation-audit` 只统计当前修订号，按冻结值判定匹配/偏离/失败，
   稳定镜像失信时拒收且不落库。
+- **风险熔断在回执写事务内统计并单向锁存**：`PUT /channels/{name}/safety`
+  按当前修订号布防规则（同修订号相同规则幂等、不同规则 409，修订号不符 409）。
+  每条新回执落库的**同一个写事务**内统计候选样本数与异常数，样本达到
+  `min_reports` 且 `anomalies × 100 > reports × max_bad_percent` 时把
+  `tripped` 置位并随回执提交——计数、锁存与回执对外要么同时可见、要么都不
+  可见。锁存单向：之后的回执覆盖（即使异常设备补交成功回执）不会解除；熔断后
+  解析把候选桶设备导向可信稳定镜像（`risk_circuit_breaker_fallback`），
+  `percent` 与修订号不变，稳定镜像失信仍返回 409；熔断后的新回执按回退决议
+  冻结应装镜像。通道更新在更新事务内**删除旧修订号的规则与锁存**，新修订号
+  初始无规则、需重新布防，这也是唯一的恢复路径。
 - **持久化**：全部状态（任务、分片字节、封存标志、签名、灰度通道策略与修订号、
-  设备安装回执）都在 SQLite 中；配合 Compose 命名卷，容器/镜像重建后任务、
-  分片、签名、通道与回执继续可用。通道的可信判定不缓存：解析与回执接收时均按
-  当前公钥实时重验。
+  设备安装回执、熔断规则与锁存状态）都在 SQLite 中；配合 Compose 命名卷，
+  容器/镜像重建后任务、分片、签名、通道、回执与熔断状态继续可用。通道的可信
+  判定不缓存：解析与回执接收时均按当前公钥实时重验。
 - 服务默认以**单个 uvicorn worker** 运行（见 Dockerfile CMD）。单 worker
   配合线程池即可并发处理请求，且与单文件 SQLite 的写模型最为匹配。
 
@@ -758,7 +869,16 @@ device_id）、`percent` 取 0/100 的边界行为、候选失信回退稳定镜
 序号规则（更小 409、同号不同内容 409、同号同内容幂等、更大覆盖且核对随之更新）、
 序号跨修订号递增、核对接口只统计当前修订号且按冻结 `expected_id` 判定、公钥
 轮换与策略更新不改写已存应装结果、模拟容器重建后回执与幂等性保持，以及与通道
-更新并发时按事务提交顺序裁决（旧修订号延迟上报不覆盖新数据）；闲置回收覆盖参数校验
+更新并发时按事务提交顺序裁决（旧修订号延迟上报不覆盖新数据）；风险熔断覆盖
+参数校验 422（`min_reports` 越界、`max_bad_percent` 越界、修订号非正）、通道
+不存在 404、修订号不符 409、同修订号相同规则幂等与改规则 409、无规则时 GET
+404、`min_reports` 样本门限与严格百分比边界（恰等不触发、越界即触发）、
+`max_bad_percent=0` 边界、失败与成功偏离均计异常而候选失信回退的回执不进样本、
+熔断在回执写事务内触发、熔断后 resolve 回退稳定镜像并标明
+`risk_circuit_breaker_fallback`（`percent`/修订号不变、稳定镜像失信仍 409）、
+熔断后新回执冻结稳定镜像且回执覆盖不解除锁存、通道更新删除旧规则与锁存且仅能
+经"更新通道 + 重新布防"恢复、旧修订号回执不计入新样本，以及规则与锁存状态
+模拟容器重建后保留；闲置回收覆盖参数校验
 422（`idle_seconds` 非正、`limit` 越界/非整数/缺失）、只回收未封存且到期任务、
 释放字节数按不相交区间精确统计、`limit` 截断与 `(last_activity_at, id)` 排序
 （含同时间戳按 ID 破并）、重复调用逐批清空、成功上传（含重复分片）刷新活动时间、

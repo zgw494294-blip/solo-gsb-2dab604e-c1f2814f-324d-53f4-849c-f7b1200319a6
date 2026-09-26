@@ -2117,3 +2117,347 @@ def test_receipts_race_channel_update_by_commit_order(client, monkeypatch):
     assert post_receipt(client, "rc-race", "dev-late", 1, "success",
                         candidate, revision=1).status_code == 409
     assert len(_receipt_rows("rc-race")) == len(stored)
+
+
+# --------------------------------------------------------------------------- #
+# Canary risk circuit breaker
+# --------------------------------------------------------------------------- #
+
+
+def arm_safety(client, name, expected_revision, min_reports, max_bad_percent):
+    return client.put(f"/channels/{name}/safety", json={
+        "expected_revision": expected_revision,
+        "min_reports": min_reports,
+        "max_bad_percent": max_bad_percent,
+    })
+
+
+def safety(client, name):
+    r = client.get(f"/channels/{name}/safety")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_safety_validation_and_missing(client, monkeypatch):
+    make_named_channel(client, monkeypatch, "sf-val", percent=100)
+
+    def code(payload, name="sf-val"):
+        return client.put(f"/channels/{name}/safety", json=payload).status_code
+
+    base = {"expected_revision": 1, "min_reports": 5, "max_bad_percent": 10}
+    assert code(base) == 200
+    # range checks on all three fields -> 422
+    assert code({**base, "min_reports": 0}) == 422
+    assert code({**base, "min_reports": 1001}) == 422
+    assert code({**base, "min_reports": 1.5}) == 422
+    assert code({**base, "max_bad_percent": -1}) == 422
+    assert code({**base, "max_bad_percent": 101}) == 422
+    assert code({**base, "expected_revision": 0}) == 422
+    assert code({**base, "expected_revision": -1}) == 422
+    assert code({}) == 422
+
+    # unknown channel -> 404 on PUT and GET
+    assert code(base, name="sf-nope") == 404
+    assert client.get("/channels/sf-nope/safety").status_code == 404
+
+    # channel without an armed rule -> 404 on GET
+    stable, candidate = make_named_channel(client, monkeypatch, "sf-none",
+                                           percent=100)
+    assert client.get("/channels/sf-none/safety").status_code == 404
+
+    # expected_revision mismatch -> 409 and nothing armed
+    assert client.put("/channels/sf-none/safety", json={
+        "expected_revision": 2, "min_reports": 5, "max_bad_percent": 10,
+    }).status_code == 409
+    assert client.put("/channels/sf-none/safety", json={
+        "expected_revision": 99, "min_reports": 5, "max_bad_percent": 10,
+    }).status_code == 409
+    assert client.get("/channels/sf-none/safety").status_code == 404
+
+
+def test_safety_arm_get_and_idempotence(client, monkeypatch):
+    make_named_channel(client, monkeypatch, "sf-arm", percent=100)
+
+    r = arm_safety(client, "sf-arm", 1, 4, 10)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["stored"] == "armed"
+    assert body["revision"] == 1 and body["rule_revision"] == 1
+    assert body["min_reports"] == 4 and body["max_bad_percent"] == 10
+    assert body["reports"] == 0 and body["anomalies"] == 0
+    assert body["tripped"] is False and body["status"] == "monitoring"
+
+    # GET mirrors the armed rule
+    assert safety(client, "sf-arm") == {k: body[k] for k in (
+        "name", "revision", "rule_revision", "min_reports",
+        "max_bad_percent", "reports", "anomalies", "tripped", "status")}
+
+    # identical resubmission at the same revision is idempotent
+    r = arm_safety(client, "sf-arm", 1, 4, 10)
+    assert r.status_code == 200 and r.json()["stored"] == "unchanged"
+    assert r.json()["tripped"] is False
+
+    # changing either rule parameter at the SAME revision conflicts 409
+    assert arm_safety(client, "sf-arm", 1, 5, 10).status_code == 409
+    assert arm_safety(client, "sf-arm", 1, 4, 20).status_code == 409
+    assert arm_safety(client, "sf-arm", 1, 5, 20).status_code == 409
+    # rule untouched
+    body = safety(client, "sf-arm")
+    assert body["min_reports"] == 4 and body["max_bad_percent"] == 10
+
+
+def test_safety_trips_at_strict_threshold_and_latches(client, monkeypatch):
+    """min_reports=2, max_bad_percent=50: 1 bad of 2 is exactly 50% (no trip,
+    strictly greater); the second anomaly crosses it; the latch then sticks
+    even when better receipts overwrite the bad ones."""
+    stable, candidate = make_named_channel(client, monkeypatch, "sf-thr",
+                                           percent=100)
+    assert arm_safety(client, "sf-thr", 1, 2, 50).status_code == 200
+
+    # one good, one bad: 1*100 == 2*50 -> NOT tripped (strict inequality)
+    assert post_receipt(client, "sf-thr", "dev-good", 1, "success",
+                        candidate).status_code == 200
+    r = post_receipt(client, "sf-thr", "dev-bad", 1, "failed")
+    assert r.status_code == 200
+    assert r.json()["circuit_breaker_tripped"] is False
+    body = safety(client, "sf-thr")
+    assert body["reports"] == 2 and body["anomalies"] == 1
+    assert body["tripped"] is False and body["status"] == "monitoring"
+
+    # second anomaly: 2*100 > 2*50 -> latches
+    assert post_receipt(client, "sf-thr", "dev-bad2", 2, "failed"
+                        ).json()["circuit_breaker_tripped"] is True
+    body = safety(client, "sf-thr")
+    assert body["reports"] == 3 and body["anomalies"] == 2
+    assert body["tripped"] is True and body["status"] == "tripped"
+
+    # resolve now rolls every canary bucket back to the stable image and
+    # marks the risk rollback; percent/revision in the response are unchanged
+    body = client.get("/channels/sf-thr/resolve",
+                      params={"device_id": "anyone"}).json()
+    assert body["image_id"] == stable
+    assert body["reason"] == "risk_circuit_breaker_fallback"
+    assert body["percent"] == 100 and body["revision"] == 1
+
+    # a new receipt after the trip freezes the stable image as expected...
+    r = post_receipt(client, "sf-thr", "dev-new", 1, "success", candidate)
+    assert r.status_code == 200
+    assert r.json()["expected_id"] == stable
+    assert r.json()["matched"] is False
+    assert r.json()["circuit_breaker_tripped"] is True
+
+    # ...and overwrite the two failed devices with clean candidate-matched
+    # reports: the latch does NOT clear ("receipt overwrites do not lift it")
+    for dev, seq in (("dev-bad", 2), ("dev-bad2", 3)):
+        r = post_receipt(client, "sf-thr", dev, seq, "success", candidate)
+        assert r.status_code == 200 and r.json()["expected_id"] == stable
+        assert r.json()["circuit_breaker_tripped"] is True
+    body = safety(client, "sf-thr")
+    assert body["tripped"] is True and body["status"] == "tripped"
+
+    # resolution keeps serving the rollback with the candidate still trusted
+    assert client.get("/channels/sf-thr/resolve",
+                      params={"device_id": "x"}).status_code == 200
+
+
+def test_safety_min_reports_gate_and_zero_percent(client, monkeypatch):
+    make_named_channel(client, monkeypatch, "sf-gate", percent=100)
+    # min_reports=3: a fully bad sample of 2 must not trip yet
+    assert arm_safety(client, "sf-gate", 1, 3, 10).status_code == 200
+    for dev in ("d1", "d2"):
+        r = post_receipt(client, "sf-gate", dev, 1, "failed")
+        assert r.json()["circuit_breaker_tripped"] is False
+    body = safety(client, "sf-gate")
+    assert body["reports"] == 2 and body["anomalies"] == 2
+    assert body["tripped"] is False
+    # third anomaly crosses min_reports and 200 > 3*10
+    assert post_receipt(client, "sf-gate", "d3", 1, "failed"
+                        ).json()["circuit_breaker_tripped"] is True
+    assert safety(client, "sf-gate")["tripped"] is True
+
+    # max_bad_percent=0: any anomaly trips as soon as min_reports is reached
+    make_named_channel(client, monkeypatch, "sf-zero", percent=100)
+    assert arm_safety(client, "sf-zero", 1, 1, 0).status_code == 200
+    assert post_receipt(client, "sf-zero", "d1", 1, "success",
+                        "does-not-exist").json()["circuit_breaker_tripped"] is True
+    body = safety(client, "sf-zero")
+    assert body["reports"] == 1 and body["anomalies"] == 1
+    assert body["tripped"] is True
+
+
+def test_safety_deviation_counts_and_match_does_not(client, monkeypatch):
+    stable, candidate = make_named_channel(client, monkeypatch, "sf-dev",
+                                           percent=100)
+    assert arm_safety(client, "sf-dev", 1, 3, 50).status_code == 200
+
+    # success with a different image is an anomaly just like a failure
+    post_receipt(client, "sf-dev", "d1", 1, "success", stable)
+    body = safety(client, "sf-dev")
+    assert body["reports"] == 1 and body["anomalies"] == 1
+
+    # two clean matched successes dilute to 1/3 = 33% <= 50%: no trip
+    post_receipt(client, "sf-dev", "d2", 1, "success", candidate)
+    r = post_receipt(client, "sf-dev", "d3", 1, "success", candidate)
+    assert r.json()["circuit_breaker_tripped"] is False
+    body = safety(client, "sf-dev")
+    assert body["reports"] == 3 and body["anomalies"] == 1
+    assert body["tripped"] is False
+
+
+def test_safety_sample_excludes_fallback_receipts(client, monkeypatch):
+    """A receipt frozen to the stable image via candidate-untrusted fallback
+    never enters the canary sample, so it can neither trip nor inflate
+    reports."""
+    sk_s1, pk_s1 = gen_key()
+    sk_s2, pk_s2 = gen_key()
+    sk_c1, pk_c1 = gen_key()
+    sk_c2, pk_c2 = gen_key()
+    all_keys = {"ops": pk_s1, "ci": pk_s2, "ops2": pk_c1, "ci2": pk_c2}
+    set_keys(monkeypatch, all_keys)
+    stable = finalize_trusted(client, os.urandom(300),
+                              {"ops": sk_s1, "ci": sk_s2})
+    candidate = finalize_trusted(client, os.urandom(300),
+                                 {"ops2": sk_c1, "ci2": sk_c2})
+    assert client.put("/channels/sf-fb", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": 100, "expected_revision": 0,
+    }).status_code == 200
+    assert arm_safety(client, "sf-fb", 1, 1, 0).status_code == 200
+
+    # rotate the candidate's keys out before any receipt: expected_id
+    # freezes to the stable fallback
+    set_keys(monkeypatch, {"ops": pk_s1, "ci": pk_s2})
+    r = post_receipt(client, "sf-fb", "d1", 1, "failed")
+    assert r.status_code == 200 and r.json()["expected_id"] == stable
+    assert r.json()["circuit_breaker_tripped"] is False
+    body = safety(client, "sf-fb")
+    assert body["reports"] == 0 and body["anomalies"] == 0
+    assert body["tripped"] is False
+
+
+def test_safety_resolve_trust_floor_after_trip(client, monkeypatch):
+    sk_s1, pk_s1 = gen_key()
+    sk_s2, pk_s2 = gen_key()
+    sk_c1, pk_c1 = gen_key()
+    sk_c2, pk_c2 = gen_key()
+    all_keys = {"ops": pk_s1, "ci": pk_s2, "ops2": pk_c1, "ci2": pk_c2}
+    set_keys(monkeypatch, all_keys)
+    stable = finalize_trusted(client, os.urandom(300),
+                              {"ops": sk_s1, "ci": sk_s2})
+    candidate = finalize_trusted(client, os.urandom(300),
+                                 {"ops2": sk_c1, "ci2": sk_c2})
+    assert client.put("/channels/sf-floor", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": 100, "expected_revision": 0,
+    }).status_code == 200
+    assert arm_safety(client, "sf-floor", 1, 1, 0).status_code == 200
+    assert post_receipt(client, "sf-floor", "d1", 1, "failed"
+                        ).json()["circuit_breaker_tripped"] is True
+
+    # candidate losing trust changes nothing: risk rollback already targets
+    # the stable image
+    set_keys(monkeypatch, {"ops": pk_s1, "ci": pk_s2})
+    body = client.get("/channels/sf-floor/resolve",
+                      params={"device_id": "d2"}).json()
+    assert body["image_id"] == stable
+    assert body["reason"] == "risk_circuit_breaker_fallback"
+
+    # stable losing trust is still a hard 409 even while tripped
+    set_keys(monkeypatch, {"ops2": pk_c1, "ci2": pk_c2})
+    assert client.get("/channels/sf-floor/resolve",
+                      params={"device_id": "d2"}).status_code == 409
+    set_keys(monkeypatch, all_keys)
+
+
+def test_safety_channel_update_invalidates_rule_and_recovers(client, monkeypatch):
+    stable, candidate = make_named_channel(client, monkeypatch, "sf-upd",
+                                           percent=100)
+    assert arm_safety(client, "sf-upd", 1, 1, 0).status_code == 200
+    assert post_receipt(client, "sf-upd", "d1", 1, "failed"
+                        ).json()["circuit_breaker_tripped"] is True
+    assert safety(client, "sf-upd")["tripped"] is True
+
+    # bumping the channel to revision 2 invalidates the old rule and latch
+    r = client.put("/channels/sf-upd", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": 100, "expected_revision": 1,
+    })
+    assert r.status_code == 200 and r.json()["revision"] == 2
+
+    # no rule armed at revision 2
+    assert client.get("/channels/sf-upd/safety").status_code == 404
+    # canary is live again at the new revision
+    body = client.get("/channels/sf-upd/resolve",
+                      params={"device_id": "d1"}).json()
+    assert body["image_id"] == candidate and body["reason"] == "candidate"
+    assert body["revision"] == 2
+    # revision-1 receipts are stale
+    assert post_receipt(client, "sf-upd", "d2", 1, "failed",
+                        revision=1).status_code == 409
+
+    # arming against the old revision is a 409; arming at revision 2 works
+    assert arm_safety(client, "sf-upd", 1, 1, 0).status_code == 409
+    r = arm_safety(client, "sf-upd", 2, 1, 0)
+    assert r.status_code == 200 and r.json()["stored"] == "armed"
+    # old-revision receipts do not feed the new sample
+    body = safety(client, "sf-upd")
+    assert body["reports"] == 0 and body["anomalies"] == 0
+    assert body["tripped"] is False
+
+
+def test_safety_persists_across_restart(client, monkeypatch):
+    stable, candidate = make_named_channel(client, monkeypatch, "sf-lts",
+                                           percent=100)
+    assert arm_safety(client, "sf-lts", 1, 1, 0).status_code == 200
+    assert post_receipt(client, "sf-lts", "d1", 1, "failed"
+                        ).json()["circuit_breaker_tripped"] is True
+
+    with TestClient(app) as c2:
+        body = c2.get("/channels/sf-lts/safety").json()
+        assert body["min_reports"] == 1 and body["max_bad_percent"] == 0
+        assert body["reports"] == 1 and body["anomalies"] == 1
+        assert body["tripped"] is True and body["status"] == "tripped"
+        # risk rollback still in force after the rebuild
+        r = c2.get("/channels/sf-lts/resolve", params={"device_id": "d9"})
+        assert r.json()["reason"] == "risk_circuit_breaker_fallback"
+        # identical rule resubmission is still the idempotent no-op;
+        # a changed rule still conflicts
+        r = c2.put("/channels/sf-lts/safety", json={
+            "expected_revision": 1, "min_reports": 1, "max_bad_percent": 0,
+        })
+        assert r.status_code == 200 and r.json()["stored"] == "unchanged"
+        r = c2.put("/channels/sf-lts/safety", json={
+            "expected_revision": 1, "min_reports": 2, "max_bad_percent": 0,
+        })
+        assert r.status_code == 409
+        # idempotent receipt replay does not untrip
+        r = c2.post("/channels/sf-lts/receipts", json={
+            "device_id": "d1", "revision": 1, "seq": 1, "status": "failed",
+        })
+        assert r.status_code == 200
+        assert r.json()["stored"] == "unchanged"
+        assert r.json()["circuit_breaker_tripped"] is True
+
+
+def test_safety_counts_only_current_revision_receipts(client, monkeypatch):
+    stable, candidate = make_named_channel(client, monkeypatch, "sf-rev",
+                                           percent=100)
+    assert arm_safety(client, "sf-rev", 1, 2, 50).status_code == 200
+    # one failure at revision 1: sample 1 < min_reports 2, no trip
+    post_receipt(client, "sf-rev", "d1", 1, "failed")
+    assert safety(client, "sf-rev")["reports"] == 1
+
+    # channel update wipes the rule and starts revision 2 unarmed
+    assert client.put("/channels/sf-rev", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": 100, "expected_revision": 1,
+    }).status_code == 200
+    assert client.get("/channels/sf-rev/safety").status_code == 404
+    assert arm_safety(client, "sf-rev", 2, 2, 50).status_code == 200
+
+    # revision-1 receipts are invisible to the revision-2 sample
+    body = safety(client, "sf-rev")
+    assert body["reports"] == 0 and body["anomalies"] == 0
+    post_receipt(client, "sf-rev", "d2", 1, "failed", revision=2)
+    body = safety(client, "sf-rev")
+    assert body["reports"] == 1 and body["anomalies"] == 1

@@ -36,6 +36,15 @@ GET    /channels/{name}/installation-audit
                                        per-device counts (success matched /
                                        success deviated / failed) over the
                                        receipts of the current revision
+PUT    /channels/{name}/safety         arm/replace the canary risk
+                                       circuit-breaker rule for the current
+                                       revision (min sample, max bad %),
+                                       guarded by an optimistic
+                                       expected_revision; identical rules
+                                       resubmitted at the same revision are
+                                       idempotent, changed rules conflict
+GET    /channels/{name}/safety         the armed rule with current sample /
+                                       anomaly counts and the tripped latch
 GET    /health                         liveness probe
 """
 
@@ -191,6 +200,26 @@ class ReceiptRequest(BaseModel):
         if self.status == "failed" and self.installed_id is not None:
             raise ValueError("installed_id must be null when status is failed")
         return self
+
+
+class SafetyRequest(BaseModel):
+    expected_revision: int = Field(
+        ...,
+        ge=1,
+        description="The channel's current revision; must match exactly",
+    )
+    min_reports: int = Field(
+        ...,
+        ge=1,
+        le=1000,
+        description="Minimum distinct-device sample before tripping",
+    )
+    max_bad_percent: int = Field(
+        ...,
+        ge=0,
+        le=100,
+        description="Strict upper bound on the anomaly percentage",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1175,6 +1204,77 @@ def _channel_row(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def _safety_row(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT channel, rule_revision, min_reports, max_bad_percent, "
+        "tripped, created_at, updated_at "
+        "FROM channel_safety WHERE channel = ?",
+        (name,),
+    ).fetchone()
+
+
+def _safety_candidate_counts(
+    conn: sqlite3.Connection, channel: sqlite3.Row
+) -> tuple[int, int]:
+    """(sample, anomalies) over the *candidate* canary of the current revision.
+
+    The sample is the current-revision receipts whose frozen ``expected_id``
+    is the channel's candidate image — i.e. devices that were *supposed* to
+    install the candidate at acceptance time (a receipt frozen to the stable
+    image via an untrusted-candidate fallback never enters the canary
+    sample).  An anomaly is a failed install, or a reported success whose
+    ``installed_id`` differs from the frozen ``expected_id``.  Each device
+    counts once through its single latest receipt.  One statement, one
+    snapshot — used both by the safety endpoint and by the in-transaction
+    latch evaluation after a new receipt lands.
+    """
+    row = conn.execute(
+        "SELECT "
+        "COALESCE(SUM(CASE WHEN r.expected_id = c.candidate_id "
+        "             THEN 1 ELSE 0 END), 0) AS sample_n, "
+        "COALESCE(SUM(CASE WHEN r.expected_id = c.candidate_id AND "
+        "    (r.status = 'failed' OR "
+        "     (r.status = 'success' AND r.installed_id <> r.expected_id)) "
+        "             THEN 1 ELSE 0 END), 0) AS bad_n "
+        "FROM channels c LEFT JOIN receipts r "
+        "  ON r.channel = c.name AND r.revision = c.revision "
+        "WHERE c.name = ? "
+        "GROUP BY c.name, c.revision",
+        (channel["name"],),
+    ).fetchone()
+    if row is None:  # channel vanished mid-transaction (defensive)
+        return 0, 0
+    return row["sample_n"], row["bad_n"]
+
+
+def _safety_tripped(
+    channel: sqlite3.Row, safety: sqlite3.Row | None
+) -> bool:
+    """Whether an armed rule latched at the *current* revision says tripped."""
+    return (
+        safety is not None
+        and safety["rule_revision"] == channel["revision"]
+        and bool(safety["tripped"])
+    )
+
+
+def _safety_payload(
+    channel: sqlite3.Row, safety: sqlite3.Row, sample: int, anomalies: int
+) -> dict:
+    tripped = bool(safety["tripped"])
+    return {
+        "name": channel["name"],
+        "revision": channel["revision"],
+        "rule_revision": safety["rule_revision"],
+        "min_reports": safety["min_reports"],
+        "max_bad_percent": safety["max_bad_percent"],
+        "reports": sample,
+        "anomalies": anomalies,
+        "tripped": tripped,
+        "status": "tripped" if tripped else "monitoring",
+    }
+
+
 def _channel_image(conn: sqlite3.Connection, role: str, image_id: str) -> sqlite3.Row:
     row = conn.execute(
         "SELECT id, total_size, sha256, finalized, created_at "
@@ -1202,7 +1302,10 @@ def _resolve_bucket(name: str, device_id: str) -> int:
 
 
 def _resolve_for_device(
-    conn: sqlite3.Connection, channel: sqlite3.Row, device_id: str
+    conn: sqlite3.Connection,
+    channel: sqlite3.Row,
+    device_id: str,
+    breaker_tripped: bool = False,
 ) -> tuple[str, str, int]:
     """Resolve one device under the stored policy: (image_id, reason, bucket).
 
@@ -1212,6 +1315,14 @@ def _resolve_for_device(
     never directed at an untrusted image.  Used both by the read-only
     resolve endpoint and by the receipt endpoint, which freezes the
     returned image id as the receipt's ``expected_id``.
+
+    When ``breaker_tripped`` is set (the channel's armed safety rule has
+    latched at this revision), every bucket that would have selected the
+    candidate is instead directed at the trusted stable image with reason
+    ``risk_circuit_breaker_fallback`` — the percentage is unchanged, so
+    the decision flips back automatically once a new revision (with a new
+    rule) is armed.  The stable image remains the trust floor regardless:
+    if it has lost trust the resolution still aborts with 409.
     """
     images = {
         role: _channel_image(conn, role, image_id)
@@ -1233,6 +1344,10 @@ def _resolve_for_device(
 
     bucket = _resolve_bucket(channel["name"], device_id)
     if bucket < channel["percent"] * 100:  # 100 buckets per percentage point
+        if breaker_tripped:
+            # Latched canary risk: steer the canary bucket to the trusted
+            # stable image and mark the risk rollback.
+            return channel["stable_id"], "risk_circuit_breaker_fallback", bucket
         if trusted["candidate"]:
             return channel["candidate_id"], "candidate", bucket
         return channel["stable_id"], "candidate_untrusted_fallback", bucket
@@ -1254,6 +1369,9 @@ def put_channel(
     attestations against the public keys configured right now, exactly like
     ``GET /images/{id}/trust``.  The whole validate-and-write runs in one
     BEGIN IMMEDIATE transaction, so concurrent updates cannot interleave.
+    Any safety rule armed at the previous revision (including a latched
+    circuit breaker) is deleted by the same transaction — the new revision
+    starts unarmed and must be re-armed via ``PUT .../safety``.
     """
     with task_lock(f"channel:{name}"):
         conn = connect()
@@ -1313,6 +1431,14 @@ def put_channel(
                         updated_at,
                     ),
                 )
+                # The accepted update starts a new revision: the armed
+                # safety rule (and its sticky latch) belongs to the old
+                # revision and is invalidated.  The new revision starts
+                # unarmed; recovery is a channel update followed by a
+                # fresh PUT .../safety at the new revision.
+                conn.execute(
+                    "DELETE FROM channel_safety WHERE channel = ?", (name,)
+                )
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -1341,14 +1467,23 @@ def resolve_channel(
     candidate, anything else the stable image.  Trust is re-verified against
     the *current* public keys on every call: an untrusted candidate falls
     back to the trusted stable image, and an untrusted stable image fails
-    the whole resolution with 409.  Read-only; nothing is persisted.
+    the whole resolution with 409.  If the channel's armed safety rule has
+    latched at this revision (risk circuit breaker tripped), every
+    candidate bucket is redirected to the trusted stable image with reason
+    ``risk_circuit_breaker_fallback``; an untrusted stable image still fails
+    with 409.  The percentage and revision are never rewritten by tripping;
+    recovery is a channel update (new revision, rule invalidated).
+    Read-only; nothing is persisted.
     """
     conn = connect()
     try:
         channel = _channel_row(conn, name)
         if channel is None:
             raise HTTPException(status_code=404, detail="channel not found")
-        image_id, reason, bucket = _resolve_for_device(conn, channel, device_id)
+        tripped = _safety_tripped(channel, _safety_row(conn, name))
+        image_id, reason, bucket = _resolve_for_device(
+            conn, channel, device_id, breaker_tripped=tripped
+        )
     finally:
         conn.close()
     return {
@@ -1360,6 +1495,140 @@ def resolve_channel(
         "bucket": bucket,
         "percent": channel["percent"],
     }
+
+
+# --------------------------------------------------------------------------- #
+# Canary risk circuit breaker
+# --------------------------------------------------------------------------- #
+
+
+@app.put("/channels/{name}/safety")
+def put_channel_safety(
+    req: SafetyRequest,
+    name: str = Path(..., min_length=1, max_length=256),
+) -> dict:
+    """Arm (or replace) the canary risk circuit-breaker rule for a channel.
+
+    ``expected_revision`` must equal the channel's *current* revision: a
+    mismatch returns 409 and nothing is written.  Each revision starts
+    unarmed — an accepted ``PUT /channels/{name}`` bumps the revision and
+    deletes the rule armed at its predecessor, so the rule must be re-armed
+    after every channel update.  Resubmitting the *identical* rule
+    (``min_reports`` and ``max_bad_percent`` unchanged) at the same revision
+    is an idempotent no-op; submitting different rule values at the same
+    revision is a 409 conflict — to change the rule, bump the channel
+    revision first.  The tripped latch is never created armed and an armed
+    latch cannot be reset by this endpoint; recovery likewise goes through a
+    channel update and re-armament.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with task_lock(f"channel:{name}"):
+        conn = connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                channel = _channel_row(conn, name)
+                if channel is None:
+                    raise HTTPException(
+                        status_code=404, detail="channel not found"
+                    )
+                if req.expected_revision != channel["revision"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"expected_revision {req.expected_revision} does "
+                            f"not match current revision "
+                            f"{channel['revision']}"
+                        ),
+                    )
+
+                safety = _safety_row(conn, name)
+                if safety is not None:
+                    if safety["rule_revision"] != channel["revision"]:
+                        # Defensive: a stale row for a superseded revision
+                        # must not survive — channel updates delete it in the
+                        # same transaction as the revision bump.
+                        conn.execute(
+                            "DELETE FROM channel_safety WHERE channel = ?",
+                            (name,),
+                        )
+                        safety = None
+                    elif (
+                        safety["min_reports"] != req.min_reports
+                        or safety["max_bad_percent"] != req.max_bad_percent
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "a different safety rule is already armed at "
+                                f"revision {channel['revision']}; update the "
+                                "channel to a new revision before changing "
+                                "min_reports or max_bad_percent"
+                            ),
+                        )
+
+                if safety is None:
+                    conn.execute(
+                        "INSERT INTO channel_safety "
+                        "(channel, rule_revision, min_reports, "
+                        " max_bad_percent, tripped, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, 0, ?, ?)",
+                        (
+                            name,
+                            channel["revision"],
+                            req.min_reports,
+                            req.max_bad_percent,
+                            now,
+                            now,
+                        ),
+                    )
+                    stored = "armed"
+                else:
+                    stored = "unchanged"
+                conn.commit()
+                safety = _safety_row(conn, name)
+                sample, anomalies = _safety_candidate_counts(conn, channel)
+            except Exception:
+                conn.rollback()
+                raise
+        finally:
+            conn.close()
+    payload = _safety_payload(channel, safety, sample, anomalies)
+    payload["stored"] = stored
+    return payload
+
+
+@app.get("/channels/{name}/safety")
+def get_channel_safety(
+    name: str = Path(..., min_length=1, max_length=256),
+) -> dict:
+    """Return the armed rule, current sample/anomaly counts and latch state.
+
+    ``reports`` is the number of devices whose current-revision receipt
+    froze the candidate image as the expected one (the canary sample);
+    ``anomalies`` counts the failed installs and successful-but-deviated
+    installs among them.  ``status`` is ``monitoring`` until, once the
+    sample reaches ``min_reports`` and ``anomalies * 100`` strictly exceeds
+    ``reports * max_bad_percent``, the breaker latches to ``tripped`` —
+    sticky for the rest of the revision.  404 if the channel does not
+    exist or the current revision has no armed rule (an earlier revision's
+    rule is gone after a channel update).  Read-only.
+    """
+    conn = connect()
+    try:
+        channel = _channel_row(conn, name)
+        if channel is None:
+            raise HTTPException(status_code=404, detail="channel not found")
+        safety = _safety_row(conn, name)
+        if safety is None or safety["rule_revision"] != channel["revision"]:
+            raise HTTPException(
+                status_code=404,
+                detail="no safety rule armed at the channel's current revision",
+            )
+        sample, anomalies = _safety_candidate_counts(conn, channel)
+    finally:
+        conn.close()
+    return _safety_payload(channel, safety, sample, anomalies)
 
 
 # --------------------------------------------------------------------------- #
@@ -1392,6 +1661,17 @@ def post_receipt(
     the stored row (its frozen ``expected_id`` included) unchanged.
     Channel updates and receipts serialize on the same per-channel lock
     and SQLite write transactions, so commit order alone arbitrates races.
+
+    When an armed safety rule exists at the current revision, the expected
+    image is resolved under the breaker's current latch state: once
+    tripped, candidate-bucket devices freeze the stable image (risk
+    rollback) as their ``expected_id``.  After a new receipt lands — but
+    never for an idempotent replay — the canary sample and anomaly counts
+    are recomputed in the SAME write transaction; once the sample reaches
+    ``min_reports`` and ``anomalies * 100`` exceeds
+    ``sample * max_bad_percent`` the breaker latches to tripped.  The
+    latch is sticky: later receipt overwrites (even with better results)
+    never clear it.
     """
     with task_lock(f"channel:{name}"):
         conn = connect()
@@ -1412,6 +1692,14 @@ def post_receipt(
                             f"{channel['revision']}"
                         ),
                     )
+
+                safety = _safety_row(conn, name)
+                if (
+                    safety is not None
+                    and safety["rule_revision"] != channel["revision"]
+                ):
+                    safety = None  # defensive: stale row of an old revision
+                tripped_before = _safety_tripped(channel, safety)
 
                 existing = conn.execute(
                     "SELECT seq, revision, status, installed_id, expected_id "
@@ -1447,9 +1735,15 @@ def post_receipt(
                     expected_id = existing["expected_id"]
                 else:
                     # New device or a larger seq: resolve the expected image
-                    # now, inside this write transaction, and freeze it.
+                    # now, inside this write transaction, and freeze it.  A
+                    # latched circuit breaker redirects candidate buckets to
+                    # the stable image at this point, so new receipts after
+                    # tripping freeze the rollback image.
                     expected_id, _, _ = _resolve_for_device(
-                        conn, channel, req.device_id
+                        conn,
+                        channel,
+                        req.device_id,
+                        breaker_tripped=tripped_before,
                     )
                     conn.execute(
                         "INSERT INTO receipts "
@@ -1475,7 +1769,34 @@ def post_receipt(
                         ),
                     )
                     stored = "recorded" if existing is None else "replaced"
+
+                    # Evaluate the risk breaker in the SAME write transaction
+                    # in which the receipt lands.  Only receipts whose frozen
+                    # expected image is the candidate form the canary sample;
+                    # a failed install or a success whose installed image
+                    # differs from the frozen one is an anomaly.  The latch
+                    # is one-way: once set it is never cleared, regardless of
+                    # how later overwrites move the percentages.
+                    if safety is not None and not tripped_before:
+                        sample_n, bad_n = _safety_candidate_counts(
+                            conn, channel
+                        )
+                        if sample_n >= safety["min_reports"] and bad_n * 100 > (
+                            sample_n * safety["max_bad_percent"]
+                        ):
+                            conn.execute(
+                                "UPDATE channel_safety SET tripped = 1, "
+                                "updated_at = ? WHERE channel = ?",
+                                (
+                                    datetime.now(timezone.utc).isoformat(),
+                                    name,
+                                ),
+                            )
                 conn.commit()
+                # Re-read the latch after commit so the response reflects a
+                # trip triggered by this very transaction.
+                safety_after = _safety_row(conn, name)
+                tripped_after = _safety_tripped(channel, safety_after)
             except Exception:
                 conn.rollback()
                 raise
@@ -1491,6 +1812,7 @@ def post_receipt(
         "expected_id": expected_id,
         "matched": req.status == "success" and req.installed_id == expected_id,
         "stored": stored,
+        "circuit_breaker_tripped": tripped_after,
     }
 
 
