@@ -2117,3 +2117,329 @@ def test_receipts_race_channel_update_by_commit_order(client, monkeypatch):
     assert post_receipt(client, "rc-race", "dev-late", 1, "success",
                         candidate, revision=1).status_code == 409
     assert len(_receipt_rows("rc-race")) == len(stored)
+
+
+# --------------------------------------------------------------------------- #
+# Risk circuit breaker
+# --------------------------------------------------------------------------- #
+
+
+def put_safety(client, name, expected_revision, min_reports, max_bad_percent):
+    return client.put(f"/channels/{name}/safety", json={
+        "expected_revision": expected_revision,
+        "min_reports": min_reports,
+        "max_bad_percent": max_bad_percent,
+    })
+
+
+def get_safety(client, name):
+    return client.get(f"/channels/{name}/safety")
+
+
+def _bucket_devices(name: str, percent: int, candidate: bool, n: int) -> list[str]:
+    """Up to n deterministic device ids landing (below|at/above) the cutoff."""
+    out = []
+    i = 0
+    while len(out) < n:
+        dev = f"cb-{name}-{i}"
+        i += 1
+        is_candidate = ref_channel_bucket(name, dev) < percent * 100
+        if is_candidate == candidate:
+            out.append(dev)
+    return out
+
+
+def test_safety_put_validation(client, monkeypatch):
+    make_named_channel(client, monkeypatch, "sf-val", percent=100)
+    base = {"expected_revision": 1, "min_reports": 5, "max_bad_percent": 50}
+
+    def code(**override):
+        return client.put("/channels/sf-val/safety",
+                          json={**base, **override}).status_code
+
+    # unknown channel -> 404
+    assert client.put("/channels/nope/safety", json=base).status_code == 404
+    assert client.get("/channels/nope/safety").status_code == 404
+    # field ranges
+    assert code(expected_revision=0) == 422
+    assert code(expected_revision=-1) == 422
+    assert code(min_reports=0) == 422
+    assert code(min_reports=1001) == 422
+    assert code(min_reports=1.5) == 422
+    assert code(max_bad_percent=-1) == 422
+    assert code(max_bad_percent=101) == 422
+    # missing fields
+    for drop in ("expected_revision", "min_reports", "max_bad_percent"):
+        body = dict(base)
+        del body[drop]
+        assert client.put("/channels/sf-val/safety", json=body).status_code == 422
+
+    # revision mismatch -> 409 and nothing is armed
+    assert put_safety(client, "sf-val", 99, 5, 50).status_code == 409
+    assert get_safety(client, "sf-val").status_code == 404
+
+    # no rule armed yet -> 404 even though the channel exists
+    assert get_safety(client, "sf-val").status_code == 404
+
+    # an integral float is accepted as an integer and arms the rule
+    assert code(max_bad_percent=10.0) == 200
+    body = get_safety(client, "sf-val").json()
+    assert body["min_reports"] == 5 and body["max_bad_percent"] == 10
+
+
+def test_safety_arm_idempotent_and_immutable(client, monkeypatch):
+    make_named_channel(client, monkeypatch, "sf-arm", percent=100)
+
+    r = put_safety(client, "sf-arm", 1, 10, 50)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["stored"] == "recorded"
+    assert body["revision"] == 1
+    assert body["min_reports"] == 10
+    assert body["max_bad_percent"] == 50
+    assert body["sample_reports"] == 0
+    assert body["abnormal_reports"] == 0
+    assert body["tripped"] is False
+    assert body["status"] == "monitoring"
+
+    # identical resubmission is idempotent and returns the stored rule
+    r = put_safety(client, "sf-arm", 1, 10, 50)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["stored"] == "unchanged"
+    assert body["min_reports"] == 10 and body["max_bad_percent"] == 50
+    assert body["tripped"] is False
+
+    # changing either value at the same revision is a 409 conflict
+    assert put_safety(client, "sf-arm", 1, 11, 50).status_code == 409
+    assert put_safety(client, "sf-arm", 1, 10, 49).status_code == 409
+
+    # the stored rule survived the rejected attempts unchanged
+    body = get_safety(client, "sf-arm").json()
+    assert body["min_reports"] == 10 and body["max_bad_percent"] == 50
+    assert body["status"] == "monitoring"
+
+
+def test_safety_success_deviation_is_abnormal(client, monkeypatch):
+    stable, candidate = make_named_channel(client, monkeypatch, "sf-dev",
+                                           percent=100)
+    # ceiling 0%: any abnormal report trips once the minimum sample is reached
+    assert put_safety(client, "sf-dev", 1, 2, 0).status_code == 200
+
+    # success but installed the stable image -> deviation, counts abnormal;
+    # sample 1 < min_reports 2 -> still monitoring
+    r = post_receipt(client, "sf-dev", "dev-1", 1, "success", stable)
+    assert r.status_code == 200 and r.json()["matched"] is False
+    body = get_safety(client, "sf-dev").json()
+    assert (body["sample_reports"], body["abnormal_reports"]) == (1, 1)
+    assert body["tripped"] is False
+
+    # one more abnormal report (a failed install) crosses the 0% ceiling
+    assert post_receipt(client, "sf-dev", "dev-2", 1, "failed").status_code == 200
+    body = get_safety(client, "sf-dev").json()
+    assert (body["sample_reports"], body["abnormal_reports"]) == (2, 2)
+    assert body["tripped"] is True and body["status"] == "tripped"
+
+
+def test_safety_threshold_is_strict_and_latch_survives_coverage(client, monkeypatch):
+    stable, candidate = make_named_channel(client, monkeypatch, "sf-trip",
+                                           percent=100)
+    # min sample 4, ceiling 50% EXCLUSIVE: exactly 50% bad must not trip
+    assert put_safety(client, "sf-trip", 1, 4, 50).status_code == 200
+
+    assert post_receipt(client, "sf-trip", "bad-1", 1, "failed").status_code == 200
+    assert post_receipt(client, "sf-trip", "bad-2", 1, "failed").status_code == 200
+    assert post_receipt(client, "sf-trip", "ok-1", 1, "success",
+                        candidate).status_code == 200
+    assert post_receipt(client, "sf-trip", "ok-2", 1, "success",
+                        candidate).status_code == 200
+    body = get_safety(client, "sf-trip").json()
+    assert (body["sample_reports"], body["abnormal_reports"]) == (4, 2)
+    assert 2 * 100 == 4 * 50  # exactly at the ceiling
+    assert body["tripped"] is False
+
+    # 3/5 = 60% > 50% -> latches
+    assert post_receipt(client, "sf-trip", "bad-3", 1, "failed").status_code == 200
+    body = get_safety(client, "sf-trip").json()
+    assert (body["sample_reports"], body["abnormal_reports"]) == (5, 3)
+    assert body["tripped"] is True
+
+    # Later receipts from NEW devices resolve to the stable fallback, so they
+    # never join the candidate sample — installed stably and matched.
+    for i in range(10):
+        r = post_receipt(client, "sf-trip", f"late-{i}", 1, "success", stable)
+        assert r.status_code == 200
+        assert r.json()["expected_id"] == stable
+        assert r.json()["matched"] is True
+    body = get_safety(client, "sf-trip").json()
+    assert (body["sample_reports"], body["abnormal_reports"]) == (5, 3)
+    assert body["tripped"] is True  # good news does not clear the latch
+
+    # Covering an old failed device with a newer (higher-seq) receipt also
+    # cannot clear it: post-trip its expectation is the stable fallback, so a
+    # stable success removes it from the candidate sample but the flag stays.
+    r = post_receipt(client, "sf-trip", "bad-1", 2, "success", stable)
+    assert r.status_code == 200 and r.json()["stored"] == "replaced"
+    body = get_safety(client, "sf-trip").json()
+    assert (body["sample_reports"], body["abnormal_reports"]) == (4, 2)
+    assert body["tripped"] is True
+
+    # re-arming the very same rule stays idempotent and stays tripped
+    r = put_safety(client, "sf-trip", 1, 4, 50)
+    assert r.status_code == 200
+    assert r.json()["stored"] == "unchanged" and r.json()["tripped"] is True
+    # changing it at the latched revision is still refused
+    assert put_safety(client, "sf-trip", 1, 4, 99).status_code == 409
+
+
+def test_safety_resolve_diverts_candidate_buckets_only(client, monkeypatch):
+    stable, candidate = make_named_channel(client, monkeypatch, "sf-res",
+                                           percent=50)
+    assert put_safety(client, "sf-res", 1, 2, 0).status_code == 200
+    cdevs = _bucket_devices("sf-res", 50, candidate=True, n=3)
+    sdevs = _bucket_devices("sf-res", 50, candidate=False, n=2)
+
+    # pre-trip: candidate buckets still get the candidate
+    body = client.get("/channels/sf-res/resolve",
+                      params={"device_id": cdevs[0]}).json()
+    assert body["image_id"] == candidate and body["reason"] == "candidate"
+
+    # two failed candidate-bucket installs trip the 0% ceiling
+    for dev in cdevs[:2]:
+        assert post_receipt(client, "sf-res", dev, 1, "failed").status_code == 200
+    assert get_safety(client, "sf-res").json()["tripped"] is True
+
+    # candidate buckets divert to trusted stable, marked as risk rollback;
+    # the canary percentage and revision are presented unchanged
+    for dev in cdevs:
+        body = client.get("/channels/sf-res/resolve",
+                          params={"device_id": dev}).json()
+        assert body["image_id"] == stable
+        assert body["reason"] == "risk_circuit_breaker_fallback"
+        assert body["bucket"] == ref_channel_bucket("sf-res", dev)
+        assert body["percent"] == 50 and body["revision"] == 1
+
+    # stable buckets are completely unaffected
+    for dev in sdevs:
+        body = client.get("/channels/sf-res/resolve",
+                          params={"device_id": dev}).json()
+        assert body["image_id"] == stable and body["reason"] == "stable"
+
+    # a fresh candidate-bucket receipt now freezes the stable image, matches a
+    # stable install, and does NOT enter the candidate sample; a stable-bucket
+    # failure does not enter it either
+    r = post_receipt(client, "sf-res", cdevs[2], 1, "success", stable)
+    assert r.json()["expected_id"] == stable and r.json()["matched"] is True
+    assert post_receipt(client, "sf-res", sdevs[0], 1, "failed").status_code == 200
+    body = get_safety(client, "sf-res").json()
+    assert (body["sample_reports"], body["abnormal_reports"]) == (2, 2)
+
+    # an untrusted stable image still fails resolution with 409
+    set_keys(monkeypatch, {})
+    assert client.get("/channels/sf-res/resolve",
+                      params={"device_id": cdevs[0]}).status_code == 409
+
+
+def test_safety_sample_excludes_candidate_untrusted_fallbacks(client, monkeypatch):
+    # disjoint key pairs per image so the candidate can lose trust alone
+    sk_s1, pk_s1 = gen_key()
+    sk_s2, pk_s2 = gen_key()
+    sk_c1, pk_c1 = gen_key()
+    sk_c2, pk_c2 = gen_key()
+    all_keys = {"ops": pk_s1, "ci": pk_s2, "ops2": pk_c1, "ci2": pk_c2}
+    set_keys(monkeypatch, all_keys)
+    stable = finalize_trusted(client, os.urandom(300), {"ops": sk_s1, "ci": sk_s2})
+    candidate = finalize_trusted(client, os.urandom(300),
+                                 {"ops2": sk_c1, "ci2": sk_c2})
+    assert client.put("/channels/sf-untrust", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": 100, "expected_revision": 0,
+    }).status_code == 200
+    # would trip on any abnormality at a sample of 2 ...
+    assert put_safety(client, "sf-untrust", 1, 2, 0).status_code == 200
+
+    # ... but while the candidate is untrusted, receipts freeze the stable
+    # fallback and never join the candidate sample
+    set_keys(monkeypatch, {"ops": pk_s1, "ci": pk_s2})
+    for i in range(3):
+        r = post_receipt(client, "sf-untrust", f"dev-{i}", 1, "success", stable)
+        assert r.status_code == 200 and r.json()["expected_id"] == stable
+    body = get_safety(client, "sf-untrust").json()
+    assert (body["sample_reports"], body["abnormal_reports"]) == (0, 0)
+    assert body["tripped"] is False
+
+    # candidate trusted again: genuine candidate-bucket failures now count
+    set_keys(monkeypatch, all_keys)
+    post_receipt(client, "sf-untrust", "real-1", 2, "failed")
+    post_receipt(client, "sf-untrust", "real-2", 2, "failed")
+    body = get_safety(client, "sf-untrust").json()
+    assert (body["sample_reports"], body["abnormal_reports"]) == (2, 2)
+    assert body["tripped"] is True
+
+
+def test_safety_channel_update_invalidates_rule_and_resets_breaker(
+    client, monkeypatch
+):
+    stable, candidate = make_named_channel(client, monkeypatch, "sf-upd",
+                                           percent=100)
+    assert put_safety(client, "sf-upd", 1, 2, 0).status_code == 200
+    post_receipt(client, "sf-upd", "dev-1", 1, "failed")
+    post_receipt(client, "sf-upd", "dev-2", 1, "failed")
+    assert get_safety(client, "sf-upd").json()["tripped"] is True
+    body = client.get("/channels/sf-upd/resolve",
+                      params={"device_id": "dev-1"}).json()
+    assert body["reason"] == "risk_circuit_breaker_fallback"
+
+    # channel update bumps revision 1 -> 2 and invalidates the old rule
+    r = client.put("/channels/sf-upd", json={
+        "stable_id": stable, "candidate_id": candidate,
+        "percent": 100, "expected_revision": 1,
+    })
+    assert r.status_code == 200 and r.json()["revision"] == 2
+
+    # old rule (latched breaker included) is gone
+    assert get_safety(client, "sf-upd").status_code == 404
+    body = client.get("/channels/sf-upd/resolve",
+                      params={"device_id": "dev-1"}).json()
+    assert body["image_id"] == candidate and body["reason"] == "candidate"
+
+    # an old-revision rule cannot be resurrected
+    assert put_safety(client, "sf-upd", 1, 2, 0).status_code == 409
+
+    # arm under the new revision: old (revision-1) receipts count for nothing
+    r = put_safety(client, "sf-upd", 2, 5, 50)
+    assert r.status_code == 200 and r.json()["stored"] == "recorded"
+    assert (r.json()["sample_reports"],
+            r.json()["abnormal_reports"]) == (0, 0)
+    assert r.json()["tripped"] is False
+
+    # stale-revision receipts stay rejected as before
+    assert post_receipt(client, "sf-upd", "dev-1", 3, "failed",
+                        revision=1).status_code == 409
+
+
+def test_safety_persists_across_restart(client, monkeypatch):
+    make_named_channel(client, monkeypatch, "sf-lts", percent=100)
+    assert put_safety(client, "sf-lts", 1, 2, 0).status_code == 200
+    post_receipt(client, "sf-lts", "dev-1", 1, "failed")
+    post_receipt(client, "sf-lts", "dev-2", 1, "failed")
+    assert get_safety(client, "sf-lts").json()["tripped"] is True
+
+    # Simulate a container rebuild: a fresh TestClient over the same DB file.
+    with TestClient(app) as c2:
+        body = c2.get("/channels/sf-lts/safety").json()
+        assert body["tripped"] is True and body["status"] == "tripped"
+        assert body["min_reports"] == 2 and body["max_bad_percent"] == 0
+        assert body["revision"] == 1
+        assert (body["sample_reports"],
+                body["abnormal_reports"]) == (2, 2)
+        # the latched diversion is still in effect
+        body = c2.get("/channels/sf-lts/resolve",
+                      params={"device_id": "dev-1"}).json()
+        assert body["reason"] == "risk_circuit_breaker_fallback"
+        # idempotent re-submission of the same rule still recognizes it
+        r = c2.put("/channels/sf-lts/safety", json={
+            "expected_revision": 1, "min_reports": 2, "max_bad_percent": 0,
+        })
+        assert r.status_code == 200
+        assert r.json()["stored"] == "unchanged" and r.json()["tripped"] is True

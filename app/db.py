@@ -43,6 +43,16 @@ computed by the channel's resolution rules inside the same write
 transaction that stored the receipt and never rewritten afterwards —
 later policy or public-key changes do not alter it, and the
 installation-audit endpoint reads it back as saved.
+
+``safety_rules`` holds at most one risk-circuit-breaker rule per channel,
+bound to the channel revision it was armed under (``min_reports`` sample
+floor plus an exclusive ``max_bad_percent`` bad-rate ceiling).  The
+``tripped`` flag is a one-way latch: once the candidate-bucket receipt
+sample crosses the armed threshold inside a receipt write transaction it
+stays set until the row is deleted.  A channel update (revision bump)
+deletes the row in its own transaction, so an old rule — latched breaker
+included — is invalidated exactly when the policy changes; arming a rule
+under the new revision is the recovery path.
 """
 
 from __future__ import annotations
@@ -148,6 +158,22 @@ def init_db(path: Optional[str] = None) -> None:
                 expected_id  TEXT    NOT NULL,
                 created_at   TEXT    NOT NULL,
                 PRIMARY KEY (channel, device_id),
+                FOREIGN KEY (channel) REFERENCES channels (name)
+            ) WITHOUT ROWID;
+
+            -- One row per channel: the armed risk-circuit-breaker rule,
+            -- bound to the channel revision it was installed under.
+            -- `tripped` is a one-way latch set inside a receipt write
+            -- transaction; a channel update deletes this row, invalidating
+            -- the old rule and resetting the latch for the new revision.
+            CREATE TABLE IF NOT EXISTS safety_rules (
+                channel         TEXT PRIMARY KEY,
+                revision        INTEGER NOT NULL,
+                min_reports     INTEGER NOT NULL,
+                max_bad_percent INTEGER NOT NULL,
+                tripped         INTEGER NOT NULL DEFAULT 0,
+                created_at      TEXT    NOT NULL,
+                updated_at      TEXT    NOT NULL,
                 FOREIGN KEY (channel) REFERENCES channels (name)
             ) WITHOUT ROWID;
             """
